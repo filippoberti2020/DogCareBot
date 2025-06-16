@@ -2,7 +2,7 @@ import logging
 import json
 import os
 from datetime import datetime
-from telegram import Update, ForceReply
+from telegram import Update, ForceReply, Bot # Import Bot class
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -14,6 +14,7 @@ from telegram.ext import (
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.base import JobLookupError
+import pytz # Import pytz for timezone handling
 
 # Enable logging
 logging.basicConfig(
@@ -22,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-BOT_TOKEN = 'YOUR_BOT_TOKEN'  # <<< IMPORTANT: Replace with your actual bot token
+BOT_TOKEN = '7755632797:AAFvQ3Q-Z79mQ8LeE6ePqo_taVhZ4rpvhZc'  # <<< IMPORTANT: Replace with your actual bot token
 DATA_FILE = 'dog_care_data.json' # File to store weights and reminders
 
 # --- Conversation States for Weight Input ---
@@ -51,7 +52,12 @@ GET_REMINDER_MESSAGE = 1
 user_data = {}
 
 # --- Scheduler Initialization ---
-scheduler = BackgroundScheduler()
+# Initialize the scheduler with a timezone to prevent localization errors
+# This timezone will be the default for jobs unless overridden
+scheduler = BackgroundScheduler(timezone='Europe/Rome') # Set timezone explicitly
+
+# This variable will hold the Bot instance, accessible globally for the scheduler.
+global_bot_instance = None
 
 # --- Helper Functions ---
 
@@ -85,7 +91,7 @@ def get_user_data(user_id):
         user_data[str(user_id)] = {"weights": [], "reminders": []}
     return user_data[str(user_id)]
 
-def schedule_reminder_job(updater, chat_id, reminder_time, reminder_message):
+def schedule_reminder_job(bot_instance: Bot, chat_id, reminder_time, reminder_message):
     """Schedules a single daily reminder job."""
     try:
         # Parse time (HH:MM)
@@ -93,20 +99,22 @@ def schedule_reminder_job(updater, chat_id, reminder_time, reminder_message):
 
         # Define the job function
         def send_reminder():
-            updater.bot.send_message(chat_id=chat_id, text=f"🔔 Reminder: {reminder_message}")
+            # Use the passed bot_instance to send the message
+            bot_instance.send_message(chat_id=chat_id, text=f"🔔 Reminder: {reminder_message}")
             logger.info(f"Reminder sent to {chat_id} at {reminder_time}")
 
         # Create a unique job ID for each reminder
-        job_id = f"reminder_{chat_id}_{reminder_time}_{reminder_message.replace(' ', '_')}"
+        # Ensure job ID is unique and consistent for removal
+        job_id = f"reminder_{chat_id}_{reminder_time}_{reminder_message.replace(' ', '_').replace('.', '').replace(',', '')}"
         
         # Check if a similar job already exists to prevent duplicates on restart
         if scheduler.get_job(job_id):
             logger.info(f"Job '{job_id}' already exists. Skipping scheduling.")
-            return
+            return True # Consider it successfully scheduled if it already exists
 
         scheduler.add_job(
             send_reminder,
-            CronTrigger(hour=hour, minute=minute),
+            CronTrigger(hour=hour, minute=minute, timezone=pytz.timezone('Europe/Rome')), # Explicitly set pytz timezone here
             id=job_id,
             replace_existing=True # Replace if a job with the same ID already exists
         )
@@ -132,12 +140,12 @@ def remove_reminder_job(job_id):
         logger.error(f"Error removing job '{job_id}': {e}")
         return False
 
-def repopulate_scheduled_jobs(updater):
+def repopulate_scheduled_jobs(bot_instance: Bot):
     """Repopulates the scheduler with reminders from user_data on bot start."""
     for user_id_str, data in user_data.items():
         chat_id = int(user_id_str) # Convert back to int for chat_id
         for reminder in data.get("reminders", []):
-            schedule_reminder_job(updater, chat_id, reminder["time"], reminder["message"])
+            schedule_reminder_job(bot_instance, chat_id, reminder["time"], reminder["message"])
     logger.info("Scheduled jobs repopulated from data file.")
 
 # --- Command Handlers ---
@@ -170,7 +178,8 @@ def add_weight_get_weight(update: Update, context: CallbackContext) -> int:
     """Receives the weight input and asks for the date."""
     weight_str = update.message.text
     try:
-        weight = float(weight_str.split()[0]) # Try to parse the number
+        # Improved parsing to handle units like "kg" or "lbs"
+        weight = float(weight_str.split()[0]) # Try to parse the number, ignoring text
         context.user_data['temp_weight'] = weight
         update.message.reply_text(
             "Got it! Now, please enter the date for this weight (YYYY-MM-DD). "
@@ -195,7 +204,7 @@ def add_weight_get_date(update: Update, context: CallbackContext) -> int:
             date = date_str
         except ValueError:
             update.message.reply_text(
-                "Invalid date format. Please use YYYY-MM-DD or 'today'. Try again:"
+                "Invalid date format. Please use असाल-MM-DD or 'today'. Try again:"
             )
             return GET_WEIGHT_DATE
 
@@ -276,15 +285,19 @@ def add_reminder_get_message(update: Update, context: CallbackContext) -> int:
         })
         save_data()
 
-        # Schedule the job
-        if schedule_reminder_job(context.dispatcher.updater, user_id, reminder_time, reminder_message):
-            update.message.reply_text(
-                f"Daily reminder set for {reminder_time} with message: '{reminder_message}' 🔔"
-            )
+        # Schedule the job using the global_bot_instance
+        if global_bot_instance:
+            if schedule_reminder_job(global_bot_instance, user_id, reminder_time, reminder_message):
+                update.message.reply_text(
+                    f"Daily reminder set for {reminder_time} with message: '{reminder_message}' 🔔"
+                )
+            else:
+                update.message.reply_text(
+                    "Failed to schedule reminder. Please check the time format."
+                )
         else:
-            update.message.reply_text(
-                "Failed to schedule reminder. Please check the time format."
-            )
+            update.message.reply_text("Bot instance not available for scheduling. Please restart the bot.")
+            logger.error("global_bot_instance is None in add_reminder_get_message.")
     else:
         update.message.reply_text(
             "Something went wrong. Please start again with /addreminder."
@@ -330,7 +343,8 @@ def delete_reminder(update: Update, context: CallbackContext) -> None:
         save_data()
 
         # Remove the job from the APScheduler
-        job_id = f"reminder_{user_id}_{deleted_reminder['time']}_{deleted_reminder['message'].replace(' ', '_')}"
+        # Reconstruct the job_id exactly as it was created in schedule_reminder_job
+        job_id = f"reminder_{user_id}_{deleted_reminder['time']}_{deleted_reminder['message'].replace(' ', '_').replace('.', '').replace(',', '')}"
         remove_reminder_job(job_id)
 
         update.message.reply_text(
@@ -357,6 +371,9 @@ def cancel(update: Update, context: CallbackContext) -> int:
 def error_handler(update: Update, context: CallbackContext) -> None:
     """Log the errors caused by Updates."""
     logger.warning('Update "%s" caused error "%s"', update, context.error)
+    # Also send a message to the user if an error occurs and update is available
+    if update and update.effective_message:
+        update.effective_message.reply_text("An error occurred! Please try again or use /cancel.")
 
 def main() -> None:
     """Start the bot."""
@@ -368,6 +385,10 @@ def main() -> None:
 
     # Get the dispatcher to register handlers
     dispatcher = updater.dispatcher
+
+    # Store the bot instance globally for APScheduler jobs to access
+    global global_bot_instance
+    global_bot_instance = updater.bot
 
     # Add conversation handler for adding weight
     add_weight_conv_handler = ConversationHandler(
@@ -404,8 +425,8 @@ def main() -> None:
 
     # Start the Scheduler
     scheduler.start()
-    # Repopulate jobs after scheduler starts
-    repopulate_scheduled_jobs(updater)
+    # Repopulate jobs after scheduler starts, passing the global bot instance
+    repopulate_scheduled_jobs(global_bot_instance)
 
     # Start the Bot
     updater.start_polling()
